@@ -1,0 +1,193 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  machines = {
+    "vm1" => {
+      ip: "192.168.56.11",
+      hostname: "vm1",
+      forward_ports: [{ guest: 3389, host: 3389 }]
+    },
+    "vm2" => {
+      ip: "192.168.56.12",
+      hostname: "vm2"
+    },
+    "vm3" => {
+      ip: "192.168.56.13",
+      hostname: "vm3"
+    }
+  }
+
+  common_provision = <<-SHELL
+    set -e
+    apt-get update && apt-get upgrade -y
+
+    # Настройка SSH
+    cat <<EOF > /etc/ssh/sshd_config.d/custom.conf
+Protocol 2
+LoginGraceTime 10
+MaxAuthTries 2
+MaxSessions 2
+PermitEmptyPasswords no
+HostbasedAuthentication no
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+EOF
+
+    systemctl restart ssh
+
+    # Обновление hosts
+    echo "192.168.56.11 vm1" >> /etc/hosts
+    echo "192.168.56.12 vm2" >> /etc/hosts
+    echo "192.168.56.13 vm3" >> /etc/hosts
+
+    # Установка пароля ubuntu
+    echo "ubuntu:123456ubuntu" | chpasswd
+
+    mkdir -p /home/ubuntu/.ssh
+    chown ubuntu:ubuntu /home/ubuntu/.ssh
+    chmod 700 /home/ubuntu/.ssh
+  SHELL
+
+  machines.each do |name, opts|
+    config.vm.define name do |vm|
+      vm.vm.hostname = opts[:hostname]
+      vm.vm.network "private_network", ip: opts[:ip]
+      (opts[:forward_ports] || []).each do |fp|
+        vm.vm.network "forwarded_port", guest: fp[:guest], host: fp[:host]
+      end
+
+      vm.vm.provision "shell", inline: common_provision
+
+      case name
+      when "vm1"
+        # Установка GUI и xrdp + генерация ключа
+        vm.vm.provision "shell", inline: <<-SHELL
+          apt-get install -y ubuntu-desktop-minimal snapd chromium-browser
+          snap install snap-store
+
+          apt-get install -y xrdp
+          systemctl enable xrdp
+          systemctl start xrdp
+
+          apt-get install -y vsftpd
+
+          # Генерация ключа
+          sudo -u ubuntu bash -c '
+            mkdir -p ~/.ssh
+            chmod 700 ~/.ssh
+            if [ ! -f ~/.ssh/id_rsa ]; then
+              ssh-keygen -t rsa -b 2048 -N "" -f ~/.ssh/id_rsa
+            fi
+          '
+
+          # Установка и настройка FTP
+          
+          mkdir -p /srv/ftp/pubkey
+          cp /home/ubuntu/.ssh/id_rsa.pub /srv/ftp/pubkey/vm1_id_rsa.pub
+
+          sed -i 's/^#\\(anonymous_enable=\\)NO/\\1YES/' /etc/vsftpd.conf
+          sed -i 's/^#\\(write_enable=\\)YES/\\1NO/' /etc/vsftpd.conf
+          echo "anon_root=/srv/ftp" >> /etc/vsftpd.conf
+
+          systemctl restart vsftpd
+        SHELL
+
+      when "vm2", "vm3"
+        # Загрузка ключа с vm1 через FTP и установка
+        vm.vm.provision "shell", inline: <<-SHELL
+          apt-get install -y ftp
+
+          # Ждём доступности FTP-сервера
+          while ! echo "quit" | ftp -n 192.168.56.11 &>/dev/null; do
+            echo "Ожидание FTP-сервера..."
+            sleep 2
+          done
+
+          cd /tmp
+          ftp -n 192.168.56.11 <<END_SCRIPT
+quote USER anonymous
+quote PASS anonymous
+cd pubkey
+get vm1_id_rsa.pub
+quit
+END_SCRIPT
+
+          mkdir -p /home/ubuntu/.ssh
+          cat /tmp/vm1_id_rsa.pub >> /home/ubuntu/.ssh/authorized_keys
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+
+            apt-get install -y ftp
+
+          echo "Ожидание FTP-сервера..."
+          until echo "quit" | ftp -n 192.168.56.11 &>/dev/null; do sleep 2; done
+
+          ftp -n 192.168.56.11 <<EOF
+        user anonymous
+        pass anonymous
+        cd pubkey
+        get vm1_id_rsa.pub
+        bye
+        EOF
+
+          mkdir -p /home/ubuntu/.ssh
+          cp vm1_id_rsa.pub /home/ubuntu/.ssh/authorized_keys
+
+          chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+          chmod 700 /home/ubuntu/.ssh
+          chmod 600 /home/ubuntu/.ssh/authorized_keys
+        SHELL
+
+        if name == "vm3"
+          vm.vm.provision "shell", inline: <<-SHELL
+            groupadd adam
+            useradd -m -d /home/adam -s /bin/bash -g adam adam
+            echo "adam ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/adam
+            chmod 440 /etc/sudoers.d/adam
+          SHELL
+        end
+
+        if name == "vm2"
+          vm.vm.provision "shell", inline: <<-SHELL
+            apt-get install -y ca-certificates curl gnupg lsb-release
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+            apt-get update
+            apt-get install -y docker-ce docker-ce-cli containerd.io
+            apt-get install -y wireguard-tools
+
+            mkdir -p /opt/wireguard-ui
+            cd /opt/wireguard-ui
+            curl -LO https://github.com/ngoduykhanh/wireguard-ui/releases/latest/download/wireguard-ui-linux-amd64
+            chmod +x wireguard-ui-linux-amd64
+            mv wireguard-ui-linux-amd64 wireguard-ui
+
+            cat <<EOF > /etc/systemd/system/wireguard-ui.service
+[Unit]
+Description=Wireguard UI
+After=network.target
+
+[Service]
+ExecStart=/opt/wireguard-ui/wireguard-ui
+Restart=always
+Environment="WG_CONF_DIR=/etc/wireguard"
+Environment="WG_INTERFACE_NAME=wg0"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+            systemctl daemon-reload
+            systemctl enable wireguard-ui
+            systemctl start wireguard-ui
+          SHELL
+        end
+      end
+    end
+  end
+end
